@@ -1120,6 +1120,14 @@ class EventLoop:
         """Copy draft->working mamba states when retract occurred (no forward scheduled)."""
         if forward_op is not None:
             return
+        # Retract with no forward scheduled: any lazily deferred KDA commit
+        # must land before the retracted requests' pages are repaged. With a
+        # forward scheduled, the backend flushes at its own metadata prep.
+        flush = getattr(
+            self.model_executor.attn_backend, "flush_kda_pending_commits", None
+        )
+        if flush is not None:
+            flush()
         if self.model_executor.drafter is None:
             return
         if self.model_executor.runtime_states.mamba_pool is None:

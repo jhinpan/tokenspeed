@@ -75,9 +75,7 @@ def _kw(t):
 def _assert_equivalent(got_out, ref_out, got, ref):
     # bf16 outputs: allow a last-bit flip (relative ~2^-8); state: ~1 ulp
     # fp32 from FMA contraction; conv windows: raw bf16 inputs, bitwise.
-    torch.testing.assert_close(
-        got_out.float(), ref_out.float(), atol=1e-3, rtol=1e-2
-    )
+    torch.testing.assert_close(got_out.float(), ref_out.float(), atol=1e-3, rtol=1e-2)
     torch.testing.assert_close(got["h_pool"], ref["h_pool"], atol=1e-6, rtol=1e-4)
     torch.testing.assert_close(got["conv_pool"], ref["conv_pool"], atol=0.0, rtol=0.0)
 
@@ -127,9 +125,7 @@ def _fused(x, n, t, accepted, commit, base=None):
     """One launch: replay prefix + deferred commit + verify."""
     y = _clone_pools(x)
     if base is None:
-        base = (
-            torch.arange(n, device=DEV, dtype=torch.int32) * t
-        )
+        base = torch.arange(n, device=DEV, dtype=torch.int32) * t
     out = fused_recurrent_kda_verify_megafuse(
         y["new_qkv"],
         y["conv_w"],

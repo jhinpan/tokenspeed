@@ -984,13 +984,24 @@ def try_kda_fused_paged_verify(
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
+    prev_qkv: torch.Tensor | None = None,
+    prev_f_a: torch.Tensor | None = None,
+    prev_beta: torch.Tensor | None = None,
+    prev_base: torch.Tensor | None = None,
+    prev_steps: torch.Tensor | None = None,
+    commit_indices: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
     Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch.
-    Verification is tentative and stores no state at all; the caller commits
-    with ``try_kda_replay_commit`` once the accepted length is known. Returns
-    ``None`` only when no implementation supports the current platform.
+    Verification stores no state of its own; the ``prev_*`` args (all
+    together) additionally replay and commit the PREVIOUS round's accepted
+    prefix on the way in -- the lazy-commit fast path, with ``prev_base < 0``
+    marking requests that have no pending window. The caller still owes the
+    matching conv-window commit (``kda_commit_conv_window``) right after,
+    and a standalone ``try_kda_replay_commit`` flush for any request that
+    leaves the verify stream. Returns ``None`` only when no implementation
+    supports the current platform.
     """
     signature = _attention_format_signature(
         q=mixed_qkv,
@@ -1023,6 +1034,12 @@ def try_kda_fused_paged_verify(
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+        prev_qkv=prev_qkv,
+        prev_f_a=prev_f_a,
+        prev_beta=prev_beta,
+        prev_base=prev_base,
+        prev_steps=prev_steps,
+        commit_indices=commit_indices,
     )
 
 

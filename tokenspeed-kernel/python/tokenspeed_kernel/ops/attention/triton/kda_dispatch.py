@@ -272,11 +272,18 @@ def triton_nvidia_kda_fused_paged_verify(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
+    prev_qkv: torch.Tensor | None = None,
+    prev_f_a: torch.Tensor | None = None,
+    prev_beta: torch.Tensor | None = None,
+    prev_base: torch.Tensor | None = None,
+    prev_steps: torch.Tensor | None = None,
+    commit_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Adapt the NVIDIA conv/GEMV/recurrent megafusion to target verify.
 
-    Writes no state: the committed pages stay intact so that
-    ``kda_replay_commit`` can rebuild the accepted prefix from them.
+    Writes no state of its own; with the ``prev_*`` args armed it also
+    replays and commits the previous round's accepted prefix on the way in
+    (the deferred lazy commit -- see the kernel docstring).
     """
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         fused_recurrent_kda_verify_megafuse,
@@ -297,6 +304,12 @@ def triton_nvidia_kda_fused_paged_verify(
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+        prev_qkv=prev_qkv,
+        prev_f_a=prev_f_a,
+        prev_beta=prev_beta,
+        prev_base=prev_base,
+        prev_steps=prev_steps,
+        commit_indices=commit_indices,
     ).view(1, -1, num_heads, head_dim)
 
 
