@@ -260,7 +260,6 @@ def triton_nvidia_kda_fused_paged_verify(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     conv_states: torch.Tensor,
-    conv_scratch: torch.Tensor,
     f_a_out: torch.Tensor,
     f_b_weight: torch.Tensor,
     beta_logits: torch.Tensor,
@@ -268,15 +267,17 @@ def triton_nvidia_kda_fused_paged_verify(
     dt_bias: torch.Tensor,
     *,
     state_pool: torch.Tensor,
-    state_scratch: torch.Tensor,
     read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
 ) -> torch.Tensor:
-    """Adapt the NVIDIA conv/GEMV/recurrent megafusion to target verify."""
+    """Adapt the NVIDIA conv/GEMV/recurrent megafusion to target verify.
+
+    Writes no state: the committed pages stay intact so that
+    ``kda_replay_commit`` can rebuild the accepted prefix from them.
+    """
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         fused_recurrent_kda_verify_megafuse,
     )
@@ -285,21 +286,77 @@ def triton_nvidia_kda_fused_paged_verify(
         mixed_qkv,
         conv_weights,
         conv_states,
-        conv_scratch,
         f_a_out,
         f_b_weight,
         beta_logits,
         A_log,
         dt_bias,
         state_pool,
-        state_scratch,
         read_indices,
-        write_indices,
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
     ).view(1, -1, num_heads, head_dim)
+
+
+@register_kernel(
+    "attention",
+    "kda_replay_commit",
+    name="triton_nvidia_kda_replay_commit",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={"flat_state": frozenset({True})},
+    tags={"nvidia", "flat_kv", "fusion", "speculative"},
+)
+def triton_nvidia_kda_replay_commit(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_out: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_out: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+) -> None:
+    """Replay the accepted prefix of a verified window into the state pool."""
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_replay_commit,
+    )
+
+    fused_recurrent_kda_replay_commit(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        conv_out,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool,
+        state_out,
+        read_indices,
+        write_indices,
+        accepted_length,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+    )
 
 
 @register_kernel(

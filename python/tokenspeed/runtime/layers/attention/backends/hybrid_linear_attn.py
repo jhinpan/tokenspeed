@@ -880,12 +880,120 @@ class MambaAttnBackend(AttentionBackend):
             tables[group_id] = rows
         return state_in_pages, committed, tables
 
+    def _kda_replay_active(self) -> bool:
+        """Whether partial accepts commit by replay instead of by scratch.
+
+        Replay re-runs the accepted prefix from the committed page, so
+        verification never has to store a state per draft position. That
+        scratch is by far the largest verify allocation -- at the K3 TP8
+        geometry it is ~795 KiB per (request, position, layer), i.e. ~10 GiB
+        at bs=64 with two draft tokens across 69 KDA layers -- so the replay
+        path skips allocating it entirely.
+
+        Only the KDA fused verify path can do this; platforms without that
+        kernel fall back to ``fused_recurrent_kda_mtp``, which still writes
+        per-position states and still needs the scratch.
+        """
+        active = getattr(self, "_kda_replay_active_cache", None)
+        if active is None:
+            active = False
+            if self.is_kda and self.flat_state_active:
+                from tokenspeed_kernel.ops.attention import kda_replay_commit_supported
+
+                active = kda_replay_commit_supported()
+            self._kda_replay_active_cache = active
+        return active
+
+    def _replay_payload(
+        self,
+        layer_id: int,
+        rows: int,
+        widths: tuple[int, int, int],
+        dtype: torch.dtype,
+    ):
+        """Per-layer capture buffers for the replay payload of one window.
+
+        Replay needs the projections the TARGET model computed while
+        verifying: the pre-convolution packed ``q|k|v``, the low-rank gate
+        input, and the raw beta logits. Those are ~9.3 KiB per token per
+        layer at the K3 TP8 geometry, against ~795 KiB for the recurrent
+        state and conv window a per-position scratch would have held -- 86x
+        less, which is the whole point of replaying.
+
+        They are copied rather than referenced because the layer forward is
+        captured into a CUDA graph and does not re-run on replay: a stashed
+        reference would point at whichever bs bucket was captured last, while
+        a copy into a stable buffer replays correctly for every bucket.
+
+        Args:
+            layer_id: KDA layer to get buffers for.
+            rows: capacity in tokens (``max_bs * draft_token_num``).
+            widths: ``(3*P, D_FA, HV)`` channel counts of the three payloads.
+            dtype: activation dtype of the captured projections.
+
+        Returns:
+            ``(qkv_raw, f_a, beta)`` buffers, each ``[rows, width]``.
+        """
+        cache = getattr(self, "_replay_payload_cache", None)
+        if cache is None or cache["rows"] < rows or cache["widths"] != widths:
+            cache = self._replay_payload_cache = {
+                "rows": rows,
+                "widths": widths,
+                "buffers": {},
+            }
+        buffers = cache["buffers"]
+        entry = buffers.get(layer_id)
+        if entry is None:
+            entry = buffers[layer_id] = tuple(
+                torch.zeros((cache["rows"], width), dtype=dtype, device=self.device)
+                for width in widths
+            )
+        return entry
+
+    def _capture_replay_payload(
+        self,
+        layer_id: int,
+        mixed_qkv: torch.Tensor,
+        f_a_out: torch.Tensor,
+        beta_raw: torch.Tensor,
+        *,
+        batch_size: int,
+        draft_token_num: int,
+        weights: tuple,
+    ) -> None:
+        """Stage one KDA layer's verify projections for a later replay.
+
+        Called from inside the captured region, so the copies replay with the
+        graph. ``weights`` holds the layer's model-lifetime tensors plus its
+        head geometry; those are bs-independent, so recording them by
+        reference is safe across CUDA-graph buckets in a way the projections
+        themselves are not.
+        """
+        rows = batch_size * draft_token_num
+        max_rows = max(len(self.state_indices_list), batch_size) * draft_token_num
+        widths = (mixed_qkv.shape[-1], f_a_out.shape[-1], beta_raw.shape[-1])
+        qkv_buf, f_a_buf, beta_buf = self._replay_payload(
+            layer_id, max_rows, widths, mixed_qkv.dtype
+        )
+        qkv_buf[:rows].copy_(mixed_qkv[:rows])
+        f_a_buf[:rows].copy_(f_a_out[:rows])
+        beta_buf[:rows].copy_(beta_raw[:rows])
+        state = getattr(self, "_replay_layer_weights", None)
+        if state is None:
+            state = self._replay_layer_weights = {}
+        state[layer_id] = weights
+
     def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
         """Lazily allocate per-group verify scratch: one init row plus
         ``draft_token_num`` per-position rows per request, for both the conv
         window and the recurrent state (rollback source for partial accepts).
         Sized once at the max the backend can see; graph warmup runs this
-        path eagerly before capture."""
+        path eagerly before capture.
+
+        Skipped entirely on the replay path, which commits from the committed
+        page instead of from a per-position row."""
+        if self._kda_replay_active():
+            return
         max_bs = max(len(self.state_indices_list), bs)
         rows_needed = max_bs * (draft_token_num + 1)
         scratch = getattr(self, "_verify_scratch", None)
@@ -1047,14 +1155,82 @@ class MambaAttnBackend(AttentionBackend):
         cache[(bs, draft_token_num)] = grid
         return grid
 
+    def _replay_commit_state(
+        self,
+        bs: int,
+        accepted: torch.Tensor,
+        draft_token_num: int,
+        write_pages_by_group: dict[str, torch.Tensor],
+        read_pages_by_group: dict[str, torch.Tensor],
+    ) -> None:
+        """Rebuild each KDA layer's committed state by replaying the accepted
+        prefix of the draft window from the pre-draft committed page.
+
+        The destination page is usually the source page (a draft window
+        rarely crosses a flat page boundary), which the replay kernels
+        support in place.
+        """
+        from tokenspeed_kernel.ops.attention import try_kda_replay_commit
+
+        weights = getattr(self, "_replay_layer_weights", None)
+        if not weights:
+            raise RuntimeError(
+                "KDA replay commit has no captured verify projections; the "
+                "verify pass must run the fused KDA path"
+            )
+        rows = bs * draft_token_num
+        accepted_i32 = accepted.to(torch.int32)
+        for layer_id in self._flat_mamba_layer_ids():
+            group_id = self.kv_pool.group_id_for_layer(layer_id)
+            (
+                conv_w,
+                f_b_weight,
+                A_log,
+                dt_bias,
+                num_heads,
+                head_dim,
+                lower_bound,
+            ) = weights[layer_id]
+            qkv_buf, f_a_buf, beta_buf = self._replay_payload_cache["buffers"][layer_id]
+            conv_comp = self.kv_pool.get_component(layer_id, "conv_state")
+            ssm_comp = self.kv_pool.get_component(layer_id, "recurrent_state")
+            ok = try_kda_replay_commit(
+                qkv_buf[:rows],
+                conv_w,
+                conv_comp,
+                conv_comp,
+                f_a_buf[:rows],
+                f_b_weight,
+                beta_buf[:rows],
+                A_log,
+                dt_bias,
+                state_pool=ssm_comp,
+                state_out=ssm_comp,
+                read_indices=read_pages_by_group[group_id][:bs],
+                write_indices=write_pages_by_group[group_id][:bs],
+                accepted_length=accepted_i32,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                draft_token_num=draft_token_num,
+                lower_bound=lower_bound,
+            )
+            if not ok:
+                raise RuntimeError(
+                    "KDA replay commit kernel vanished after the capability "
+                    "probe reported it available"
+                )
+
     def flat_commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Commit the accepted draft position's state (conv window +
-        recurrent) from the verify scratch into each group's state slab at
-        the new committed page. All device-side; graph-safe."""
+        """Commit the state for the accepted draft prefix into each group's
+        state slab at the new committed page. All device-side; graph-safe.
+
+        On the replay path the accepted prefix is re-run from the committed
+        page (see ``_kda_replay_active``); otherwise the accepted position's
+        row is copied out of the per-position verify scratch."""
         ctx = getattr(self, "_verify_commit_ctx", None)
         if ctx is None:
             return
-        committed, tables, draft_token_num = ctx
+        committed, tables, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
         k = accepted_length.to(torch.int64).clamp(min=1, max=draft_token_num)
         new_last = committed[:bs] + k - 1
@@ -1075,6 +1251,12 @@ class MambaAttnBackend(AttentionBackend):
                 .to(torch.int64)
                 .clamp_min(0)
             )
+        if self._kda_replay_active():
+            self._replay_commit_state(
+                bs, k, draft_token_num, pages_by_group, read_pages_by_group
+            )
+            self._verify_commit_ctx = None
+            return
         # Batched commit: scratch row -> committed page for every KDA layer in
         # one launch per state kind (was a per-layer gather/scatter pair).
         from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
@@ -1298,6 +1480,7 @@ class MambaAttnBackend(AttentionBackend):
                     verify_committed,
                     verify_tables,
                     draft_token_num,
+                    state_in_pages_by_group,
                 )
             elif self._flat_contract_bound:
                 (
@@ -1765,6 +1948,7 @@ class MambaAttnBackend(AttentionBackend):
                     verify_committed,
                     verify_tables,
                     draft_token_num,
+                    pages_by_group,
                 )
             else:
                 self._verify_commit_ctx = None
@@ -2217,25 +2401,42 @@ class MambaAttnBackend(AttentionBackend):
                 and kwargs.get("bias") is None
             ):
                 # Verify megafusion: conv(+silu), f_b gate GEMV, and the
-                # per-position recurrence in one launch, per-position conv
-                # windows and states landing in the verify scratches.
+                # per-position recurrence in one launch. It writes no state:
+                # verification is tentative, so the committed pages are left
+                # intact as the anchor the post-acceptance replay starts from,
+                # and the projections it consumed are captured for that replay.
                 state_in_pages, _, conv_comp, ssm_states = flat_state
-                conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
                 num_value_heads = value_dim // attn_tp_size // head_v_dim
+                f_a_out = kwargs["f_a_out"]
+                if self._kda_replay_active():
+                    self._capture_replay_payload(
+                        layer_id,
+                        mixed_qkv,
+                        f_a_out,
+                        beta_raw,
+                        batch_size=batch_size,
+                        draft_token_num=draft_token_num,
+                        weights=(
+                            conv_weights,
+                            kwargs["f_b_weight"],
+                            A_log,
+                            dt_bias,
+                            num_value_heads,
+                            head_v_dim,
+                            kda_lower_bound,
+                        ),
+                    )
                 fused_out = try_kda_fused_paged_verify(
                     mixed_qkv,
                     conv_weights,
                     conv_comp,
-                    conv_scratch,
-                    kwargs["f_a_out"],
+                    f_a_out,
                     kwargs["f_b_weight"],
                     beta_raw,
                     A_log,
                     dt_bias,
                     state_pool=ssm_states,
-                    state_scratch=ssm_scratch,
                     read_indices=state_in_pages[:batch_size],
-                    write_indices=output_indices[:batch_size],
                     num_heads=num_value_heads,
                     head_dim=head_v_dim,
                     draft_token_num=draft_token_num,
@@ -2251,6 +2452,15 @@ class MambaAttnBackend(AttentionBackend):
                 # the captured region so replays re-read the refreshed
                 # state_in buffers.
                 state_in_pages, _, conv_comp, ssm_states = flat_state
+                if self._kda_replay_active():
+                    # The scratch this path needs was deliberately not
+                    # allocated, so failing over to it would surface as a
+                    # confusing KeyError several frames down.
+                    raise RuntimeError(
+                        "KDA verify fell through to the per-position scratch "
+                        "path while replay commit is active; the fused KDA "
+                        "verify kernel must handle every verify batch"
+                    )
                 conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
                 if layer_id == self._flat_mamba_layer_ids()[0]:
                     self._seed_verify_scratch_batched(batch_size, draft_token_num)

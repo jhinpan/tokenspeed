@@ -129,6 +129,8 @@ __all__ = [
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
+    "try_kda_replay_commit",
+    "kda_replay_commit_supported",
     "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
@@ -968,7 +970,6 @@ def try_kda_fused_paged_verify(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     conv_states: torch.Tensor,
-    conv_scratch: torch.Tensor,
     f_a_out: torch.Tensor,
     f_b_weight: torch.Tensor,
     beta_logits: torch.Tensor,
@@ -976,9 +977,7 @@ def try_kda_fused_paged_verify(
     dt_bias: torch.Tensor,
     *,
     state_pool: torch.Tensor,
-    state_scratch: torch.Tensor,
     read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
@@ -988,10 +987,10 @@ def try_kda_fused_paged_verify(
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
-    Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch:
-    per-position conv windows and recurrent states land in the verify
-    scratches for partial-accept commit. Returns ``None`` only when no
-    implementation supports the current platform.
+    Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch.
+    Verification is tentative and stores no state at all; the caller commits
+    with ``try_kda_replay_commit`` once the accepted length is known. Returns
+    ``None`` only when no implementation supports the current platform.
     """
     signature = _attention_format_signature(
         q=mixed_qkv,
@@ -1013,21 +1012,122 @@ def try_kda_fused_paged_verify(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
         conv_states=conv_states,
-        conv_scratch=conv_scratch,
         f_a_out=f_a_out,
         f_b_weight=f_b_weight,
         beta_logits=beta_logits,
         A_log=A_log,
         dt_bias=dt_bias,
         state_pool=state_pool,
-        state_scratch=state_scratch,
         read_indices=read_indices,
-        write_indices=write_indices,
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
     )
+
+
+def kda_replay_commit_supported(
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    solution: str | None = None,
+) -> bool:
+    """Whether this platform has a KDA speculative replay-commit kernel.
+
+    Lets a caller decide up front whether it can skip allocating a
+    per-draft-position state scratch, before any verify batch has run.
+
+    Args:
+        dtype: activation dtype the verify batch will use.
+        solution: restrict to one registered solution, as in ``select_kernel``.
+
+    Returns:
+        ``True`` when a kernel is registered for the current platform.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
+
+
+def try_kda_replay_commit(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_out: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_out: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> bool:
+    """Try a registered KDA speculative replay-commit.
+
+    Replays the accepted prefix of a verified draft window from the committed
+    page, so the caller never has to keep a recurrent state per draft
+    position. Pass the SAME projections the verify pass consumed.
+
+    Returns:
+        ``True`` when a kernel ran, ``False`` when none supports the current
+        platform (the caller must then fall back to a scratch-based commit).
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return False
+    kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        conv_out=conv_out,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        state_out=state_out,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        accepted_length=accepted_length,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+    )
+    return True
 
 
 # ===-----------------------------------------------------------------------===#

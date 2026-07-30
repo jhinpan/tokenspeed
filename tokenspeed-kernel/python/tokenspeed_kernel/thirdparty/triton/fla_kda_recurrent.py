@@ -493,21 +493,21 @@ def fused_recurrent_kda_mtp(
 
 @triton.heuristics({"USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None})
 @triton.jit
-def fused_recurrent_kda_verify_megafuse_fwd_kernel(
+def fused_recurrent_kda_window_fwd_kernel(
     qkv_raw,  # [N*T, 3*P] pre-conv packed projections (token-strided)
     conv_w,  # [3*P, 4] fused conv bank
     conv_pool,  # [pages, 3*P, 3] committed conv state (read-only here)
-    conv_out,  # [rows, 3*P, 3] per-position conv windows (verify scratch)
     f_a,  # [N*T, D_FA] low-rank gate input
     w_fb,  # [P, D_FA] f_b weight
     beta,
     A_log,
     dt_bias,
-    o,
+    o,  # [N*T, HV, V] per-position output (WRITE_OUTPUT only)
     h_pool,  # committed recurrent state (read-only here)
-    h_pool_out,  # per-position recurrent states (verify scratch)
+    h_pool_out,  # recurrent commit destination (STORE_FINAL only)
     read_indices,  # [N] committed page per request (-1 = fresh)
-    write_indices,  # [N*T] scratch rows, request-major
+    write_indices,  # [N] destination page per request (STORE_FINAL only)
+    n_steps,  # [N] tokens to consume per request (HAS_N_STEPS only)
     lower_bound,
     stride_raw_tok: tl.constexpr,
     stride_fa_tok: tl.constexpr,
@@ -525,15 +525,35 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     stride_state_page: tl.constexpr,
     stride_state_out_page: tl.constexpr,
     stride_conv_page: tl.constexpr,
-    stride_conv_out_page: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    WRITE_OUTPUT: tl.constexpr,
+    STORE_FINAL: tl.constexpr,
+    HAS_N_STEPS: tl.constexpr,
 ):
-    """Target-verify variant of the KDA megafusion: conv(+silu), the f_b gate
-    GEMV, and the delta-rule recurrence run per draft position, with BOTH the
-    rolled conv window and the evolved recurrent state stored to their verify
-    scratch row after every step (``write_indices[n*T + t]``) so a partial
-    accept can commit the state at the accepted position."""
+    """Run a window of KDA decode steps from a committed page: conv(+silu),
+    the f_b gate GEMV, and the delta-rule recurrence, per token.
+
+    One kernel serves both halves of speculative decoding, so the two can
+    never drift apart numerically:
+
+    - **target verify** (``WRITE_OUTPUT``, no ``STORE_FINAL``) consumes all
+      ``T`` draft positions and emits their outputs. The evolved state stays
+      in registers and is thrown away: verification is tentative, and its
+      final state ``S_{N+T}`` is only correct if every draft token is
+      accepted.
+    - **replay commit** (``STORE_FINAL``, ``HAS_N_STEPS``, no output)
+      re-consumes the first ``n_steps[n]`` positions of the same window from
+      the same committed page, and stores the resulting conv window and
+      recurrent state to ``write_indices[n]``. That reconstructs exactly the
+      state a non-speculative decode of the accepted tokens would have
+      reached, without verification ever having to materialize (and the
+      caller ever having to keep) a state per draft position.
+
+    ``n_steps[n] == 0`` is meaningful and must stay supported: it commits the
+    committed state unchanged, which is what an all-rejected window needs
+    when the destination page differs from the source page.
+    """
     pid = tl.program_id(0)
     NV = tl.cdiv(V, BV)
     i_v = pid % NV
@@ -615,7 +635,12 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
             tl.float32
         )
 
-    for i_t in range(T):
+    steps = T
+    if HAS_N_STEPS:
+        # Clamped by the caller; a request may consume fewer than T tokens.
+        steps = tl.load(n_steps + i_n).to(tl.int32)
+
+    for i_t in range(steps):
         tok = bos + i_t
         x_q = tl.load(qkv_raw + tok * stride_raw_tok + qf, mask=mask_k, other=0.0).to(
             tl.float32
@@ -639,20 +664,6 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
         s_k0, s_k1, s_k2 = s_k1, s_k2, x_k
         s_v0, s_v1, s_v2 = s_v1, s_v2, x_v
 
-        b_write = tl.load(write_indices + i_n * T + i_t).to(tl.int64)
-        write_ok = b_write >= 0
-        # per-position conv window (q/k dupes across NV write same values)
-        cw = conv_out + b_write * stride_conv_out_page
-        tl.store(cw + qf * 3 + 0, s_q0.to(cw.dtype.element_ty), mask=mask_k & write_ok)
-        tl.store(cw + qf * 3 + 1, s_q1.to(cw.dtype.element_ty), mask=mask_k & write_ok)
-        tl.store(cw + qf * 3 + 2, s_q2.to(cw.dtype.element_ty), mask=mask_k & write_ok)
-        tl.store(cw + kf * 3 + 0, s_k0.to(cw.dtype.element_ty), mask=mask_k & write_ok)
-        tl.store(cw + kf * 3 + 1, s_k1.to(cw.dtype.element_ty), mask=mask_k & write_ok)
-        tl.store(cw + kf * 3 + 2, s_k2.to(cw.dtype.element_ty), mask=mask_k & write_ok)
-        tl.store(cw + vf * 3 + 0, s_v0.to(cw.dtype.element_ty), mask=mask_v & write_ok)
-        tl.store(cw + vf * 3 + 1, s_v1.to(cw.dtype.element_ty), mask=mask_v & write_ok)
-        tl.store(cw + vf * 3 + 2, s_v2.to(cw.dtype.element_ty), mask=mask_v & write_ok)
-
         # f_b gate GEMV for this token
         fa = tl.load(f_a + tok * stride_fa_tok + o_fa).to(tl.float32)
         b_g = tl.sum(wfb * fa[None, :], axis=1)
@@ -675,13 +686,24 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
         b_beta = tl.sigmoid(b_beta)
         b_v *= b_beta
         b_h += b_k[:, None] * b_v[None, :]
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        tl.store(
-            o + (tok * HV + i_hv) * V + o_v,
-            b_o.to(o.dtype.element_ty),
-            mask=mask_v,
-        )
+        if WRITE_OUTPUT:
+            b_o = tl.sum(b_h * b_q[:, None], 0)
+            tl.store(
+                o + (tok * HV + i_hv) * V + o_v,
+                b_o.to(o.dtype.element_ty),
+                mask=mask_v,
+            )
 
+    if STORE_FINAL:
+        b_write = tl.load(write_indices + i_n).to(tl.int64)
+        write_ok = b_write >= 0
+        # Only the recurrent state is committed here. Each program owns a
+        # disjoint [BK, BV] slice of it, so writing the destination page is
+        # safe even when it IS the source page (the common case: the new
+        # position usually lands in the same flat page). The conv window has
+        # no such luck -- its q/k slots are indexed by head alone, so every
+        # program of the NV split would read and rewrite the same slots --
+        # so it is committed by kda_commit_conv_window instead.
         p_ht = (
             h_pool_out
             + b_write * stride_state_out_page
@@ -692,7 +714,163 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h & write_ok)
 
 
+def _launch_kda_window(
+    qkv_raw: torch.Tensor,
+    conv_w: torch.Tensor,
+    conv_pool: torch.Tensor,
+    f_a: torch.Tensor,
+    w_fb: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    h_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    *,
+    h_pool_out: torch.Tensor | None,
+    write_indices: torch.Tensor | None,
+    n_steps: torch.Tensor | None,
+    out: torch.Tensor | None,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    scale: float | None,
+    lower_bound: float | None,
+) -> None:
+    """Shared launch for the verify and replay halves of the window kernel."""
+    total = qkv_raw.shape[0]
+    T = draft_token_num
+    N = total // T
+    HV = num_heads
+    K = V = head_dim
+    if scale is None:
+        scale = K**-0.5
+    assert total == N * T
+    assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
+    store_final = h_pool_out is not None
+    assert store_final == (write_indices is not None)
+    if store_final:
+        assert write_indices.numel() == N
+    if n_steps is not None:
+        assert n_steps.numel() == N
+    BV = 32
+    grid = (triton.cdiv(V, BV) * N * HV,)
+    fused_recurrent_kda_window_fwd_kernel[grid](
+        qkv_raw=qkv_raw,
+        conv_w=conv_w,
+        conv_pool=conv_pool,
+        f_a=f_a,
+        w_fb=w_fb,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        o=out,
+        h_pool=h_pool,
+        h_pool_out=h_pool_out,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        n_steps=n_steps,
+        lower_bound=lower_bound,
+        stride_raw_tok=qkv_raw.stride(0),
+        stride_fa_tok=f_a.stride(0),
+        stride_beta_tok=beta.stride(0),
+        scale=scale,
+        T=T,
+        H=HV,
+        HV=HV,
+        K=K,
+        V=V,
+        P=HV * K,
+        D_FA=f_a.shape[-1],
+        BK=triton.next_power_of_2(K),
+        BV=BV,
+        stride_state_page=h_pool.stride(0),
+        stride_state_out_page=h_pool_out.stride(0) if store_final else 0,
+        stride_conv_page=conv_pool.stride(0),
+        HAS_DT_BIAS=dt_bias is not None,
+        WRITE_OUTPUT=out is not None,
+        STORE_FINAL=store_final,
+        HAS_N_STEPS=n_steps is not None,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
 def fused_recurrent_kda_verify_megafuse(
+    qkv_raw: torch.Tensor,
+    conv_w: torch.Tensor,
+    conv_pool: torch.Tensor,
+    f_a: torch.Tensor,
+    w_fb: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    h_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    scale: float | None = None,
+    lower_bound: float | None = None,
+) -> torch.Tensor:
+    """Target-verify KDA megafusion: conv1d(+silu), f_b gate GEMV, and the
+    per-position recurrence in one launch.
+
+    Verification is tentative and writes no state at all. The evolved state
+    is only correct for a fully accepted window, so rather than storing one
+    state per draft position and picking the accepted one, the caller commits
+    by calling ``fused_recurrent_kda_replay_commit`` with the accepted length
+    once acceptance is known. The committed pages stay untouched here, which
+    is what makes that replay anchor available.
+
+    Args:
+        qkv_raw: ``[N*T, 3*P]`` pre-conv packed q|k|v, request-major.
+        conv_w: ``[3*P, 4]`` fused conv kernel bank (contiguous).
+        conv_pool: ``[pages, 3*P, 3]`` committed conv state (read-only).
+        f_a: ``[N*T, D]`` gate input; w_fb: ``[P, D]`` up weight.
+        beta: ``[N*T, HV]`` raw logits (sigmoid in-kernel).
+        h_pool: ``[pages, HV, K, V]`` committed recurrent slab (read-only).
+        read_indices: ``[N]`` committed page per request (-1 = fresh).
+        num_heads/head_dim: per-rank head geometry (P = num_heads*head_dim).
+        draft_token_num: draft positions per request (T).
+        scale: q scale; defaults to ``head_dim ** -0.5``.
+        lower_bound: gate lower bound; ``None`` selects the softplus gate.
+
+    Returns:
+        o: ``[N*T, HV, V]`` attention output in ``qkv_raw``'s dtype.
+    """
+    out = torch.empty(
+        qkv_raw.shape[0],
+        num_heads,
+        head_dim,
+        dtype=qkv_raw.dtype,
+        device=qkv_raw.device,
+    )
+    _launch_kda_window(
+        qkv_raw,
+        conv_w,
+        conv_pool,
+        f_a,
+        w_fb,
+        beta,
+        A_log,
+        dt_bias,
+        h_pool,
+        read_indices,
+        h_pool_out=None,
+        write_indices=None,
+        n_steps=None,
+        out=out,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        scale=scale,
+        lower_bound=lower_bound,
+    )
+    return out
+
+
+def fused_recurrent_kda_replay_commit(
     qkv_raw: torch.Tensor,
     conv_w: torch.Tensor,
     conv_pool: torch.Tensor,
@@ -706,83 +884,180 @@ def fused_recurrent_kda_verify_megafuse(
     h_pool_out: torch.Tensor,
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
     *,
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
     scale: float | None = None,
     lower_bound: float | None = None,
-) -> torch.Tensor:
-    """Target-verify KDA megafusion: conv1d(+silu), f_b gate GEMV, and the
-    per-position recurrence in one launch, with per-position conv windows and
-    recurrent states stored to the verify scratch for partial-accept commit.
+) -> None:
+    """Commit the accepted prefix of a verified draft window by replaying it.
+
+    Re-runs ``accepted_length[n]`` steps of the same window that
+    ``fused_recurrent_kda_verify_megafuse`` just verified, from the same
+    committed page, and stores the resulting conv window and recurrent state
+    to ``write_indices[n]``. Because it is the same kernel doing the same
+    arithmetic in the same order, the committed state is exactly the one a
+    non-speculative decode of those tokens would have produced.
+
+    The projections in ``qkv_raw`` / ``f_a`` / ``beta`` must be the ones the
+    **target** model computed during verification, not the draft model's. For
+    a position inside the accepted prefix every preceding position was also
+    accepted, so the hidden state those projections came from is the true
+    one; positions past the accepted prefix are stale and are never replayed.
+
+    Args:
+        qkv_raw: ``[N*T, 3*P]`` pre-conv packed q|k|v captured during verify.
+        conv_w: ``[3*P, 4]`` fused conv kernel bank (contiguous).
+        conv_pool: ``[pages, 3*P, 3]`` committed conv state (read).
+        conv_out: conv destination slab; may alias ``conv_pool``.
+        f_a: ``[N*T, D]`` gate input; w_fb: ``[P, D]`` up weight.
+        beta: ``[N*T, HV]`` raw logits (sigmoid in-kernel).
+        h_pool: ``[pages, HV, K, V]`` committed recurrent slab (read).
+        h_pool_out: recurrent destination slab; may alias ``h_pool``.
+        read_indices: ``[N]`` committed page per request (-1 = fresh).
+        write_indices: ``[N]`` destination page per request (-1 skips).
+        accepted_length: ``[N]`` tokens to replay, in ``[0, T]``.
+        num_heads/head_dim: per-rank head geometry (P = num_heads*head_dim).
+        draft_token_num: draft positions per request (T).
+        scale: q scale; defaults to ``head_dim ** -0.5``.
+        lower_bound: gate lower bound; ``None`` selects the softplus gate.
+
+    Returns:
+        None. The destination pages are written in place.
+    """
+    steps = accepted_length.to(torch.int32).clamp(0, draft_token_num)
+    _launch_kda_window(
+        qkv_raw,
+        conv_w,
+        conv_pool,
+        f_a,
+        w_fb,
+        beta,
+        A_log,
+        dt_bias,
+        h_pool,
+        read_indices,
+        h_pool_out=h_pool_out,
+        write_indices=write_indices,
+        n_steps=steps,
+        out=None,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        scale=scale,
+        lower_bound=lower_bound,
+    )
+    kda_commit_conv_window(
+        qkv_raw,
+        conv_pool,
+        conv_out,
+        read_indices,
+        write_indices,
+        steps,
+        conv_dim=3 * num_heads * head_dim,
+        draft_token_num=draft_token_num,
+    )
+
+
+@triton.jit
+def kda_commit_conv_window_kernel(
+    qkv_raw,  # [N*T, 3*P] pre-conv packed projections (token-strided)
+    conv_pool,  # [pages, 3*P, 3] committed conv window (read)
+    conv_out,  # [pages, 3*P, 3] destination (may alias conv_pool)
+    read_indices,  # [N] committed page per request (-1 = fresh)
+    write_indices,  # [N] destination page per request (-1 skips)
+    n_steps,  # [N] tokens consumed per request
+    stride_raw_tok: tl.constexpr,
+    stride_conv_page: tl.constexpr,
+    stride_conv_out_page: tl.constexpr,
+    T: tl.constexpr,
+    CONV_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Roll a committed conv window forward by ``n_steps`` raw tokens.
+
+    The 4-tap causal conv keeps the three preceding raw projections per
+    channel, so committing the window after a replayed prefix is just a shift
+    of the last ``min(n_steps, 3)`` raw values in -- no convolution needed.
+
+    This is a separate launch from the recurrence because the window is
+    indexed by channel alone: in the recurrence kernel every program of the
+    NV column split shares (and would rewrite) the same q/k channels, which
+    races against their own reads as soon as the destination page is the
+    source page. Here one program owns a channel block outright, so the
+    in-place case is safe by construction.
+    """
+    i_n = tl.program_id(0)
+    i_c = tl.program_id(1)
+
+    b_write = tl.load(write_indices + i_n).to(tl.int64)
+    if b_write < 0:
+        return
+    b_read = tl.load(read_indices + i_n).to(tl.int64)
+    steps = tl.load(n_steps + i_n).to(tl.int32)
+
+    offsets = i_c * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < CONV_DIM
+
+    src = conv_pool + b_read * stride_conv_page + offsets * 3
+    s0 = tl.load(src + 0, mask=mask & (b_read >= 0), other=0.0)
+    s1 = tl.load(src + 1, mask=mask & (b_read >= 0), other=0.0)
+    s2 = tl.load(src + 2, mask=mask & (b_read >= 0), other=0.0)
+
+    for i_t in range(steps):
+        x = tl.load(
+            qkv_raw + (i_n * T + i_t) * stride_raw_tok + offsets, mask=mask, other=0.0
+        )
+        s0, s1, s2 = s1, s2, x
+
+    dst = conv_out + b_write * stride_conv_out_page + offsets * 3
+    tl.store(dst + 0, s0, mask=mask)
+    tl.store(dst + 1, s1, mask=mask)
+    tl.store(dst + 2, s2, mask=mask)
+
+
+def kda_commit_conv_window(
+    qkv_raw: torch.Tensor,
+    conv_pool: torch.Tensor,
+    conv_out: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    n_steps: torch.Tensor,
+    *,
+    conv_dim: int,
+    draft_token_num: int,
+) -> None:
+    """Commit each request's conv window after replaying ``n_steps`` tokens.
 
     Args:
         qkv_raw: ``[N*T, 3*P]`` pre-conv packed q|k|v, request-major.
-        conv_w: ``[3*P, 4]`` fused conv kernel bank (contiguous).
-        conv_pool: ``[pages, 3*P, 3]`` committed conv state (read-only).
-        conv_out: ``[rows, 3*P, 3]`` verify conv scratch (per-position writes).
-        f_a: ``[N*T, D]`` gate input; w_fb: ``[P, D]`` up weight.
-        beta: ``[N*T, HV]`` raw logits (sigmoid in-kernel).
-        h_pool / h_pool_out: committed recurrent slab / verify scratch.
+        conv_pool: ``[pages, 3*P, 3]`` committed conv window (read).
+        conv_out: destination slab; may be ``conv_pool`` itself.
         read_indices: ``[N]`` committed page per request (-1 = fresh).
-        write_indices: ``[N, T]`` or ``[N*T]`` scratch row ids.
-        num_heads/head_dim: per-rank head geometry (P = num_heads*head_dim).
+        write_indices: ``[N]`` destination page per request (-1 skips).
+        n_steps: ``[N]`` tokens consumed, in ``[0, draft_token_num]``.
+        conv_dim: channel count ``3 * num_heads * head_dim``.
         draft_token_num: draft positions per request (T).
 
     Returns:
-        o: ``[N*T, HV, V]`` attention output in ``qkv_raw``'s dtype.
+        None. The destination windows are written in place.
     """
-    total = qkv_raw.shape[0]
-    T = draft_token_num
-    N = total // T
-    HV = num_heads
-    K = V = head_dim
-    P = HV * K
-    D = f_a.shape[-1]
-    if scale is None:
-        scale = K**-0.5
-    assert total == N * T
-    assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
-    assert write_indices.numel() == N * T
-    out = torch.empty(total, HV, V, dtype=qkv_raw.dtype, device=qkv_raw.device)
-    BV = 32
-    grid = (triton.cdiv(V, BV) * N * HV,)
-    fused_recurrent_kda_verify_megafuse_fwd_kernel[grid](
+    n = write_indices.numel()
+    block = 256
+    kda_commit_conv_window_kernel[(n, triton.cdiv(conv_dim, block))](
         qkv_raw=qkv_raw,
-        conv_w=conv_w,
         conv_pool=conv_pool,
         conv_out=conv_out,
-        f_a=f_a,
-        w_fb=w_fb,
-        beta=beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        o=out,
-        h_pool=h_pool,
-        h_pool_out=h_pool_out,
         read_indices=read_indices,
-        write_indices=write_indices.reshape(-1),
-        lower_bound=lower_bound,
+        write_indices=write_indices,
+        n_steps=n_steps,
         stride_raw_tok=qkv_raw.stride(0),
-        stride_fa_tok=f_a.stride(0),
-        stride_beta_tok=beta.stride(0),
-        scale=scale,
-        T=T,
-        H=HV,
-        HV=HV,
-        K=K,
-        V=V,
-        P=P,
-        D_FA=D,
-        BK=triton.next_power_of_2(K),
-        BV=BV,
-        stride_state_page=h_pool.stride(0),
-        stride_state_out_page=h_pool_out.stride(0),
         stride_conv_page=conv_pool.stride(0),
         stride_conv_out_page=conv_out.stride(0),
-        HAS_DT_BIAS=dt_bias is not None,
+        T=draft_token_num,
+        CONV_DIM=conv_dim,
+        BLOCK=block,
         num_warps=4,
-        num_stages=2,
     )
-    return out
