@@ -44,9 +44,9 @@ def _window(n, t, pages=32, seed=0):
     g = torch.Generator(device="cpu").manual_seed(seed)
 
     def rnd(*shape, dtype=torch.bfloat16, scale=1.0):
-        return (
-            torch.randn(*shape, generator=g, dtype=torch.float32) * scale
-        ).to(device=DEV, dtype=dtype)
+        return (torch.randn(*shape, generator=g, dtype=torch.float32) * scale).to(
+            device=DEV, dtype=dtype
+        )
 
     return dict(
         qkv_raw=rnd(n * t, 3 * P),
@@ -211,7 +211,9 @@ def test_mixed_accepted_lengths_in_one_batch():
     torch.testing.assert_close(
         out_padded["conv_pool"][w], x["conv_pool"][w], atol=0.0, rtol=0.0
     )
-    torch.testing.assert_close(out_padded["h_pool"][w], x["h_pool"][w], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(
+        out_padded["h_pool"][w], x["h_pool"][w], atol=0.0, rtol=0.0
+    )
 
 
 def test_committing_into_the_source_page_matches_a_fresh_page():
