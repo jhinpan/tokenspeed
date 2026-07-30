@@ -1155,6 +1155,14 @@ class MambaAttnBackend(AttentionBackend):
         buffers = cache["buffers"]
         entry = buffers.get(layer_id)
         if entry is None:
+            # Normally preallocated by _preallocate_kda_replay_buffers; this
+            # fallback covers enforce-eager runs (no graph-state init) and a
+            # model whose f_a width defies the preallocation guess. Either
+            # way it must never fire inside a capture -- the tensor would
+            # come from the capture mempool and alias across graphs.
+            assert (
+                not torch.cuda.is_current_stream_capturing()
+            ), "KDA replay payload buffers must exist before graph capture"
             # Outside inference mode for the same reason as the lazy control
             # buffers: the flush path feeds these to kernels from metadata
             # prep, outside the mode they would otherwise be created under.
@@ -1882,6 +1890,35 @@ class MambaAttnBackend(AttentionBackend):
             )
         self._qsl_dirty = [False] * max_num_tokens
         self._qsl_last_mode = [None] * max_num_tokens
+        if self._kda_replay_active() and self.speculative_num_draft_tokens > 1:
+            self._preallocate_kda_replay_buffers(max_num_tokens)
+
+    def _preallocate_kda_replay_buffers(self, max_bs: int) -> None:
+        """Allocate every lazy-commit buffer before any forward runs.
+
+        Called from ``init_cuda_graph_state`` -- after ``set_kv_pool`` (so
+        the pool components give the payload geometry) and before any
+        warmup, capture, or inference-mode context. Keeping the forward path
+        allocation-free avoids inference-mode tensor restrictions and any
+        chance of a first touch landing inside a capture mempool.
+
+        The f_a payload width is not in the pool geometry; KDA's low-rank
+        gate uses the state head dim (K3: 128 == K). If a model ever
+        disagrees, the width check in ``_replay_payload`` rebuilds the
+        buffers during the eager warmup forward, before anything captures.
+        """
+        rows = max(max_bs, 1) * int(self.speculative_num_draft_tokens)
+        for layer_id in self._flat_mamba_layer_ids():
+            conv = self.kv_pool.get_component(layer_id, "conv_state")
+            ssm = self.kv_pool.get_component(layer_id, "recurrent_state")
+            hv, k = ssm.shape[1], ssm.shape[2]
+            self._replay_payload(
+                layer_id,
+                rows,
+                (conv.shape[1], k, hv),
+                self.dtype,
+            )
+        self._kda_lazy_buffers(min_slots=max_bs)
 
     def init_forward_metadata_capture_cuda_graph(
         self,

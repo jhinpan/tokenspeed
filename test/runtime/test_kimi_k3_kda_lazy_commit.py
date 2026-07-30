@@ -22,12 +22,12 @@ if not torch.cuda.is_available():
 from test.runtime.conftest import KIMI_STATE_GROUPS as _STATE_GROUPS
 from test.runtime.conftest import flat_metadata_for as _metadata_for
 from test.runtime.conftest import make_kimi_pool as _make_kimi_pool
+from types import SimpleNamespace  # noqa: E402  (after torch guard)
+
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     MambaAttnBackend,
 )
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-
-from types import SimpleNamespace  # noqa: E402  (after torch guard)
 
 _LOWER_BOUND = -5.0
 H, D, D_FA = 4, 128, 128
@@ -67,17 +67,12 @@ class _Harness:
         self.layer_ids = list(self.backend._flat_mamba_layer_ids())
         self.params = {
             layer_id: dict(
-                conv_weights=torch.randn(
-                    CONV_DIM, 4, device=DEV, dtype=torch.bfloat16
-                )
+                conv_weights=torch.randn(CONV_DIM, 4, device=DEV, dtype=torch.bfloat16)
                 * 0.1,
-                f_b_weight=torch.randn(
-                    KEY_DIM, D_FA, device=DEV, dtype=torch.bfloat16
-                )
+                f_b_weight=torch.randn(KEY_DIM, D_FA, device=DEV, dtype=torch.bfloat16)
                 * 0.05,
                 A_log=torch.randn(H, device=DEV, dtype=torch.float32) * 0.1,
-                dt_bias=torch.randn(KEY_DIM, device=DEV, dtype=torch.float32)
-                * 0.1,
+                dt_bias=torch.randn(KEY_DIM, device=DEV, dtype=torch.float32) * 0.1,
             )
             for layer_id in self.layer_ids
         }
