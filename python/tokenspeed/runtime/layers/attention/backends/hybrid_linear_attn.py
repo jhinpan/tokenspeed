@@ -920,16 +920,21 @@ class MambaAttnBackend(AttentionBackend):
         if bufs is None or bufs["base"].shape[0] < cap:
             # Growth happens outside any captured region (metadata prep or an
             # eager warmup forward); graph capture then records the final,
-            # largest allocation.
-            mk = lambda: torch.full(  # noqa: E731
-                (cap,), -1, dtype=torch.int32, device=self.device
-            )
-            bufs = self._kda_lazy_bufs = {
-                "base": mk(),
-                "steps": torch.zeros(cap, dtype=torch.int32, device=self.device),
-                "anchor": {g: mk() for g in self._flat_state_group_ids},
-                "commit": {g: mk() for g in self._flat_state_group_ids},
-            }
+            # largest allocation. Allocated outside inference mode: the first
+            # touch may come from a warmup forward running under
+            # torch.inference_mode, but metadata prep refreshes these in
+            # place from OUTSIDE it, which PyTorch forbids for inference
+            # tensors.
+            with torch.inference_mode(False):
+                mk = lambda: torch.full(  # noqa: E731
+                    (cap,), -1, dtype=torch.int32, device=self.device
+                )
+                bufs = self._kda_lazy_bufs = {
+                    "base": mk(),
+                    "steps": torch.zeros(cap, dtype=torch.int32, device=self.device),
+                    "anchor": {g: mk() for g in self._flat_state_group_ids},
+                    "commit": {g: mk() for g in self._flat_state_group_ids},
+                }
         return bufs
 
     def _arm_kda_pending(
@@ -1150,10 +1155,14 @@ class MambaAttnBackend(AttentionBackend):
         buffers = cache["buffers"]
         entry = buffers.get(layer_id)
         if entry is None:
-            entry = buffers[layer_id] = tuple(
-                torch.zeros((cache["rows"], width), dtype=dtype, device=self.device)
-                for width in widths
-            )
+            # Outside inference mode for the same reason as the lazy control
+            # buffers: the flush path feeds these to kernels from metadata
+            # prep, outside the mode they would otherwise be created under.
+            with torch.inference_mode(False):
+                entry = buffers[layer_id] = tuple(
+                    torch.zeros((cache["rows"], width), dtype=dtype, device=self.device)
+                    for width in widths
+                )
         return entry
 
     def _capture_replay_payload(
