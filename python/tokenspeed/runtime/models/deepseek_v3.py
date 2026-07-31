@@ -1853,6 +1853,13 @@ class Eagle3MlaDecoderLayer(nn.Module):
         self.layer_id = layer_id
         rope_theta = get_rope_theta(config)
         rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling and "factor" not in rope_scaling:
+            # Newer transformers normalizes rope params into rope_scaling
+            # ({"rope_theta": ..., "rope_type": "default"}) even when the
+            # checkpoint declares none. Only a real scaling config (one
+            # with a factor) may engage the deepseek_yarn path below --
+            # anything else is plain rope.
+            rope_scaling = None
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.self_attn = DeepseekV3DraftAttentionMLA(
@@ -2251,8 +2258,15 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
             and self.config.target_hidden_size != self.config.hidden_size
         ):
             return
-        del self.model.embed_tokens.weight
-        self.model.embed_tokens.weight = embed
+        if self.model.embed_tokens.weight.shape == embed.shape:
+            # Sharing is only sound when the target's embedding layout
+            # matches this module's: both replicated (DeepSeek) or both
+            # sharded identically. A vocab-parallel target (Kimi-K3, TP
+            # shard) handed to this replicated module would leave ids
+            # beyond the shard reading out of bounds -- in that case keep
+            # the draft checkpoint's own full embedding instead.
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
         if head is not None and self.load_lm_head_from_target:
             del self.lm_head.weight
             self.lm_head.weight = head
