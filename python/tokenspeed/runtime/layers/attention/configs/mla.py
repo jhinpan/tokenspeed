@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -41,6 +41,17 @@ class MLAConfig(BaseAttnConfig):
     v_head_dim: int
     scaling: float
     kv_cache_dim: int
+    # Per-step token budget, forwarded to the KV pool for paged-cache group
+    # publication sizing (mirrors MHAConfig). MLA/DSA publish a single
+    # full-history group, whose sizing does not read this value today; it is
+    # plumbed so the canonical publication API is called with real inputs.
+    #
+    # kw_only: MLAConfig is a positional dataclass, so a defaulted field here
+    # would sit ahead of DSAConfig's required index_topk/index_head_dim/
+    # index_n_heads and break subclass construction ("non-default argument
+    # follows default argument"). Keeping it keyword-only takes it out of the
+    # positional ordering entirely.
+    max_scheduled_tokens: int = field(default=0, kw_only=True)
 
     @classmethod
     def generate(
@@ -78,6 +89,7 @@ class MLAConfig(BaseAttnConfig):
             v_head_dim=model_config.v_head_dim,
             scaling=model_config.scaling,
             kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
+            max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 0) or 0,
             **kwargs,
         )
 
@@ -117,4 +129,5 @@ class MLAConfig(BaseAttnConfig):
             max_context_len=self.context_len,
             page_size=self.page_size,
             rank=rank,
+            max_scheduled_tokens=self.max_scheduled_tokens,
         )
