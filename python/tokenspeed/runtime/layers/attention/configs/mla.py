@@ -41,16 +41,9 @@ class MLAConfig(BaseAttnConfig):
     v_head_dim: int
     scaling: float
     kv_cache_dim: int
-    # Per-step token budget, forwarded to the KV pool for paged-cache group
-    # publication sizing (mirrors MHAConfig). MLA/DSA publish a single
-    # full-history group, whose sizing does not read this value today; it is
-    # plumbed so the canonical publication API is called with real inputs.
-    #
-    # kw_only: MLAConfig is a positional dataclass, so a defaulted field here
-    # would sit ahead of DSAConfig's required index_topk/index_head_dim/
-    # index_n_heads and break subclass construction ("non-default argument
-    # follows default argument"). Keeping it keyword-only takes it out of the
-    # positional ordering entirely.
+    # Per-step token budget for paged-cache group publication sizing (mirrors
+    # MHAConfig). kw_only: MLAConfig is a positional dataclass, so a defaulted
+    # field here would sit ahead of DSAConfig's required index_* fields.
     max_scheduled_tokens: int = field(default=0, kw_only=True)
 
     @classmethod
