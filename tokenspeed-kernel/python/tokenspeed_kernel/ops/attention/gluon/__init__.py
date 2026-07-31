@@ -66,6 +66,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.attention.gluon.mha_prefill_gfx1250 import (
         gluon_mha_prefill_gfx1250 as _prefill_gfx1250_impl,
     )
+    from tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_bf16_gfx1250 import (
+        gluon_mla_decode_bf16_gfx1250 as _mla_decode_bf16_gfx1250_impl,
+    )
     from tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_gfx950 import (
         gluon_mla_decode_bf16xbf16_gfx950 as _mla_decode_bf16xbf16_impl,
     )
@@ -75,10 +78,7 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_gfx950 import (
         gluon_mla_decode_fp8xfp8_gfx950 as _mla_decode_fp8xfp8_impl,
     )
-    from tokenspeed_kernel_amd.ops.attention.gluon.mla_gfx1250 import (
-        gluon_mla_decode_bf16_gfx1250 as _mla_decode_bf16_gfx1250_impl,
-    )
-    from tokenspeed_kernel_amd.ops.attention.gluon.mla_gfx1250 import (
+    from tokenspeed_kernel_amd.ops.attention.gluon.mla_extend_bf16_gfx1250 import (
         gluon_mla_extend_bf16_gfx1250 as _mla_extend_bf16_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.attention.gluon.mla_prefill_bf16_gfx950 import (
