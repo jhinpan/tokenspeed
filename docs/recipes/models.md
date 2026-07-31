@@ -182,6 +182,12 @@ Notes:
   (fp8 KV required). AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
+- K3 EAGLE3 target capture uses the draft checkpoint's layer ids directly.
+  For the validated three-state draft this is `--eagle3-layers-to-capture
+  2,46,90`; do not pass the training-side zero-based `[1,45,89]` ids to
+  serving.
+  These are vLLM's one-based completed-layer ids: capture occurs after the
+  named K3 layer, before the model-level final AttnRes mix and final norm.
 - Point `--model` at a **flattened local copy** of the checkpoint: real files
   for the configs/tokenizer/`*.py` (weights may stay symlinks). An HF hub
   snapshot directory fails engine startup — `tokenization_kimi.py`'s relative
