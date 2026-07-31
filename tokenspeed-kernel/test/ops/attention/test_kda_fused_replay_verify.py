@@ -406,3 +406,65 @@ def test_chained_rounds_track_sequential_decode():
     torch.testing.assert_close(
         lazy["conv_pool"], eager["conv_pool"], atol=0.0, rtol=0.0
     )
+
+
+def test_stale_commit_slot_without_pending_writes_nothing():
+    """Red-team regression: base = -1 must gate the commit store too.
+
+    A stale page id in the commit slot of a request that has NO pending
+    window (base = -1) used to get the anchor state written over it,
+    desyncing that page's recurrent state from its conv window. The store
+    is now gated on both indices.
+    """
+    n, t = 4, 2
+    x = _window(n, t, seed=41)
+    none_base = torch.full((n,), -1, device=DEV, dtype=torch.int32)
+    stale_commit = torch.arange(1, n + 1, device=DEV, dtype=torch.int32) + 24
+    accepted = torch.full((n,), t, device=DEV, dtype=torch.int32)
+    h_before = x["h_pool"].clone()
+    conv_before = x["conv_pool"].clone()
+    _fused(x, n, t, accepted, stale_commit, base=none_base)
+    # _fused clones the pools; re-run against the originals directly to
+    # assert the shared slabs are untouched.
+    out = fused_recurrent_kda_verify_megafuse(
+        x["new_qkv"],
+        x["conv_w"],
+        x["conv_pool"],
+        x["new_f_a"],
+        x["w_fb"],
+        x["new_beta"],
+        x["A_log"],
+        x["dt_bias"],
+        x["h_pool"],
+        x["anchor"],
+        prev_qkv=x["prev_qkv"],
+        prev_f_a=x["prev_f_a"],
+        prev_beta=x["prev_beta"],
+        prev_base=none_base,
+        prev_steps=accepted,
+        commit_indices=stale_commit,
+        **_kw(t),
+    )
+    assert torch.isfinite(out.float()).all()
+    torch.testing.assert_close(x["h_pool"], h_before, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(x["conv_pool"], conv_before, atol=0.0, rtol=0.0)
+
+
+def test_fused_prev_steps_clamped_to_window():
+    """Red-team regression: an out-of-range step count must clamp to T.
+
+    The standalone replay entry clamps accepted_length; the fused prefix
+    used to consume prev_steps raw, silently replaying the next request's
+    first payload row (or reading past the buffer for the last request).
+    steps = T + 1 must now behave exactly like steps = T.
+    """
+    n, t = 3, 2
+    x = _window(n, t, seed=43)
+    commit = torch.arange(1, n + 1, device=DEV, dtype=torch.int32) + 24
+    exact = torch.full((n,), t, device=DEV, dtype=torch.int32)
+    over = torch.full((n,), t + 1, device=DEV, dtype=torch.int32)
+    ref_out, ref = _fused(x, n, t, exact, commit)
+    got_out, got = _fused(x, n, t, over, commit)
+    torch.testing.assert_close(got_out, ref_out, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(got["h_pool"], ref["h_pool"], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(got["conv_pool"], ref["conv_pool"], atol=0.0, rtol=0.0)

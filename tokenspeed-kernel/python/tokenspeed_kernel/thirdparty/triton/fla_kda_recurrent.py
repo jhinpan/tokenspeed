@@ -684,6 +684,14 @@ def fused_recurrent_kda_window_fwd_kernel(
     supported: they commit the anchor state unchanged, which is what an
     all-rejected window needs when the destination page differs from the
     source page.
+
+    Page-ownership precondition (NOT checked in-kernel): every commit /
+    write page must be exclusively owned by its request for this launch.
+    Two rows committing to one page interleave per-program slices into a
+    torn mixture, and one row's commit page doubling as another row's
+    anchor makes the reader's view scheduling-defined (old or new state
+    depending on grid position). The FlatKV pager upholds exclusivity by
+    construction; any other caller must too.
     """
     pid = tl.program_id(0)
     NV = tl.cdiv(V, BV)
@@ -775,7 +783,12 @@ def fused_recurrent_kda_window_fwd_kernel(
         p_base = tl.load(prev_base + i_n).to(tl.int64)
         r_steps = 0
         if p_base >= 0:
-            r_steps = tl.load(prev_steps + i_n).to(tl.int32)
+            # Clamp like the standalone replay entry clamps accepted_length:
+            # an out-of-range step count must not walk into the next
+            # request's payload rows (or off the end of the buffer).
+            r_steps = tl.minimum(
+                tl.maximum(tl.load(prev_steps + i_n).to(tl.int32), 0), T
+            )
         for i_t in range(r_steps):
             ptok = p_base + i_t
             (
@@ -836,8 +849,14 @@ def fused_recurrent_kda_window_fwd_kernel(
                 USE_LOWER_BOUND=USE_LOWER_BOUND,
                 COMPUTE_OUT=False,
             )
+        # The commit store is gated on BOTH indices: a request without a
+        # pending window (p_base < 0) must degenerate to a plain verify and
+        # write nothing, even if its commit slot holds a stale page id --
+        # otherwise the anchor state would clobber that page and desync it
+        # from its conv window (which kda_commit_conv_window correctly
+        # skips on base < 0).
         b_commit = tl.load(commit_indices + i_n).to(tl.int64)
-        if b_commit >= 0:
+        if p_base >= 0 and b_commit >= 0:
             # Safe in place (commit page == anchor page is the common case):
             # each program reads and writes only its own [BK, BV] slice. The
             # conv window is committed by kda_commit_conv_window instead --
@@ -1267,6 +1286,7 @@ def kda_commit_conv_window_kernel(
     stride_raw_tok: tl.constexpr,
     stride_conv_page: tl.constexpr,
     stride_conv_out_page: tl.constexpr,
+    T: tl.constexpr,
     CONV_DIM: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -1291,7 +1311,9 @@ def kda_commit_conv_window_kernel(
     if b_write < 0 or base < 0:
         return
     b_read = tl.load(read_indices + i_n).to(tl.int64)
-    steps = tl.load(n_steps + i_n).to(tl.int32)
+    # Same clamp as the recurrence kernel: never walk past this request's
+    # payload rows.
+    steps = tl.minimum(tl.maximum(tl.load(n_steps + i_n).to(tl.int32), 0), T)
 
     offsets = i_c * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < CONV_DIM
@@ -1362,6 +1384,7 @@ def kda_commit_conv_window(
         stride_raw_tok=qkv_raw.stride(0),
         stride_conv_page=conv_pool.stride(0),
         stride_conv_out_page=conv_out.stride(0),
+        T=draft_token_num,
         CONV_DIM=conv_dim,
         BLOCK=block,
         num_warps=4,
