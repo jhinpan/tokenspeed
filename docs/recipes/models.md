@@ -185,6 +185,12 @@ Notes:
   longer required.
 - The checkpoint carries no fp8 KV scaling factors; the loader defaults them
   to 1.0 (a warning at load). Expect a small accuracy delta vs bf16 KV.
+- With the prefill graph enabled at attn-tp16, the graph pool (~4.5 GB for
+  93 layers x 40 buckets) plus serving transients need headroom:
+  `--gpu-memory-utilization 0.90` (0.94 OOMs at the first ~1k-token prefill,
+  after a successful capture). Prefill runs the FP8 FMHA kernels; the NoPE
+  path quantizes standalone since the fused RoPE+quantize kernel does not
+  apply.
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,
   use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
   on a different whole image.

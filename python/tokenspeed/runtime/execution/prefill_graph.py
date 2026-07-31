@@ -345,6 +345,7 @@ class PrefillGraph:
                 "prefill. This model family may need dedicated dummy-batch support.",
                 type(exc).__name__,
                 exc,
+                exc_info=True,
             )
             captured_ok = False
         if not self._capture_unanimous(captured_ok):
