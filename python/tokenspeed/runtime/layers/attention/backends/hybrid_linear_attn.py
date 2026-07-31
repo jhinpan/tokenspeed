@@ -967,9 +967,28 @@ class MambaAttnBackend(AttentionBackend):
                     state_in_by_group[gid][:real_bs].to(torch.int32)
                 )
         if real_bs <= 0:
+            # Idle / fully padded verify replay. The captured graph includes
+            # the payload-capture copies, which re-execute with whatever junk
+            # the input buffers hold -- so a pending kept across this round
+            # would replay from clobbered payload later. Commit it NOW, while
+            # the payload is still intact (metadata prep runs before the
+            # graph replay).
+            self._flush_kda_pending()
             return
         pending = getattr(self, "_kda_pending", None)
         if pending is None:
+            return
+        cache = getattr(self, "_replay_payload_cache", None)
+        needed_rows = max(len(self.state_indices_list), real_bs) * int(
+            self.speculative_num_draft_tokens
+        )
+        if cache is not None and cache["rows"] < needed_rows:
+            # This round's payload capture would rebuild the buffers the
+            # pending's replay reads (enforce-eager batch growth; graph mode
+            # preallocates at max). Commit the pending now -- BEFORE arming,
+            # so the fused kernels see no pending and the forward starts
+            # from clean composed buffers.
+            self._flush_kda_pending()
             return
         op = kwargs.get("flat_cache_forward_op")
         rpis = list(getattr(op, "request_pool_indices", None) or [])[:real_bs]
@@ -993,6 +1012,22 @@ class MambaAttnBackend(AttentionBackend):
         )
         has = slot_map >= 0
         safe = slot_map.clamp_min(0)
+        # Identity check beyond the rpi: a finished request's pool index can
+        # be recycled by a NEW request that enters verify without any
+        # non-verify forward in between. The impostor's committed page never
+        # matches the dead pending's commit page, so gate on that (one state
+        # group suffices -- groups page in lockstep). Mismatched entries are
+        # simply not armed; the record after this round's forward replaces
+        # the whole pending, which garbage-collects them. They are NOT
+        # flushed: the dead request's pages may already belong to someone
+        # else.
+        check_gid = self._flat_state_group_ids[0]
+        pending_commit = (
+            pending["commit_by_group"][check_gid].to(torch.int64).gather(0, safe)
+        )
+        has = has & (
+            pending_commit == state_in_by_group[check_gid][:real_bs].to(torch.int64)
+        )
         neg = torch.full_like(slot_map, -1)
         bufs["base"][:real_bs].copy_(
             torch.where(has, safe * t_prev, neg).to(torch.int32)
@@ -1015,8 +1050,15 @@ class MambaAttnBackend(AttentionBackend):
             bufs["commit"][gid][:real_bs].copy_(
                 torch.where(has, commit, neg).to(torch.int32)
             )
-        # Consumed: this round's fused kernels perform the commit.
-        self._kda_pending = None
+        # NOT consumed here: the pending survives until the record that
+        # follows a COMPLETED verify forward replaces it. If the forward is
+        # abandoned after this prep (retract), the pending is still intact
+        # and the retract-hook flush commits it from the untouched anchor;
+        # if the forward runs, the record overwrites it with the new window.
+        # A forward that dies mid-layer is fatal at the engine level (the
+        # scheduler re-raises and the rank exits), which is what makes
+        # arm -> forward -> record atomic as far as this machinery sees.
+        return
 
     def _flush_kda_pending(self, only_rpis=None) -> None:
         """Commit pending windows with the standalone replay kernels.
@@ -1147,6 +1189,12 @@ class MambaAttnBackend(AttentionBackend):
         """
         cache = getattr(self, "_replay_payload_cache", None)
         if cache is None or cache["rows"] < rows or cache["widths"] != widths:
+            # A rebuild replaces the tensors a live pending's replay would
+            # read (enforce-eager batch growth reaches here; graph mode is
+            # preallocated at max size). Commit that pending first, while
+            # its payload still exists.
+            if cache is not None:
+                self._flush_kda_pending()
             cache = self._replay_payload_cache = {
                 "rows": rows,
                 "widths": widths,
@@ -1413,7 +1461,10 @@ class MambaAttnBackend(AttentionBackend):
             # Lazy commit: record what a replay needs and let the NEXT verify
             # round's fused kernel perform it on the way in. Anything that
             # leaves the verify stream first is flushed by
-            # ``_flush_kda_pending`` at the next metadata prep.
+            # ``_flush_kda_pending`` at the next metadata prep. Overwriting
+            # ``_kda_pending`` here is the consumption point of the PREVIOUS
+            # pending: reaching this record means the verify forward that
+            # was armed with it completed, i.e. its commit happened.
             rpis = ctx[4] if len(ctx) > 4 else []
             self._kda_pending = dict(
                 slot_by_rpi={r: i for i, r in enumerate(rpis[:bs])},
